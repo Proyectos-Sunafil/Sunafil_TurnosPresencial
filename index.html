@@ -15,7 +15,7 @@
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.95.3"></script>
 <script>
 const SUPABASE_URL='https://jasuqnxrskhqfobsazwd.supabase.co',KEY='sb_publishable_sQH_z37OD2mzNMoL4M3Lwg_jF8Lpmx2';
-const db=window.supabase?.createClient(SUPABASE_URL,KEY),$=id=>document.getElementById(id),names=['Lunes','Martes','Miércoles','Jueves','Viernes'],abbr=['Lun','Mar','Mié','Jue','Vie'];
+const db=(()=>{try{return window.supabase?.createClient(SUPABASE_URL,KEY)||null}catch(e){console.warn("Editor no disponible:",e);return null}})(),$=id=>document.getElementById(id),names=['Lunes','Martes','Miércoles','Jueves','Viernes'],abbr=['Lun','Mar','Mié','Jue','Vie'];
 let people=[],events=[],record=null,revision=0,role='',sessionEmail='',dirty=false,panel='',ruleTarget=null,week;
 const localDate=s=>new Date(s+'T12:00:00'),iso=d=>[d.getFullYear(),String(d.getMonth()+1).padStart(2,'0'),String(d.getDate()).padStart(2,'0')].join('-'),add=(d,n)=>new Date(d.getFullYear(),d.getMonth(),d.getDate()+n),monday=d=>add(d,-((d.getDay()+6)%7)),wd=s=>(localDate(s).getDay()+6)%7,dates=()=>Array.from({length:5},(_,i)=>iso(add(week,i))),wk=()=>iso(week),esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 week=monday(new Date());
@@ -60,12 +60,43 @@ function closeAccess(){$('access').classList.add('hidden');}
 async function login(){if(!db){$('loginError').textContent='No se cargó Supabase.';return;}let email=$('email').value.trim(),password=$('loginPwd').value||$('savePassword').value;if(!email||!password){$('loginError').textContent='Ingresa correo y contraseña del editor.';return;}const pending=dirty,{error}=await db.auth.signInWithPassword({email,password});$('loginPwd').value='';$('savePassword').value='';if(error){$('loginError').textContent=error.message;return;}localStorage.setItem('cronograma_email',email);await boot(pending);if(role!=='editor'){$('loginError').textContent='La cuenta no tiene permiso de edición. Solicita su autorización en Supabase.';return;}closeAccess();if(pending)await saveAll(true);else say('Sesión de editor iniciada. Puedes grabar cambios.');}
 async function signup(){if(!db)return;const email=$('email').value.trim(),password=$('loginPwd').value;if(!email||password.length<8){$('loginError').textContent='Introduce un correo y una clave de al menos 8 caracteres.';return;}const options=location.protocol==='https:'?{emailRedirectTo:location.origin+location.pathname}:{};const {error}=await db.auth.signUp({email,password,options});$('loginPwd').value='';$('loginError').textContent=error?error.message:'Cuenta solicitada. Confirma tu correo; después un administrador deberá habilitarte como editor.';}
 async function logout(){if(dirty&&!confirm('Hay cambios sin grabar. ¿Cerrar sesión?'))return;await db?.auth.signOut();role='';sessionEmail='';dirty=false;closeAccess();closePanel();await load();say('Sesión de edición cerrada. La vista del cronograma sigue disponible.');}
-async function boot(preserveDraft=false){if(!db){say('No se pudo cargar Supabase. Comprueba la conexión.',true);return;}const {data:{user}}=await db.auth.getUser();role='';sessionEmail=user?.email||'';if(user){const {data:permission}=await db.from('cronograma_usuarios').select('rol').eq('usuario_id',user.id).maybeSingle();role=permission?.rol||'';}if(preserveDraft&&record){render();return;}await load();}
-async function connectRead(){if(dirty&&!confirm('Hay cambios sin grabar. ¿Descartarlos y actualizar?'))return;await boot();}
-async function load(){const [r,a,e]=await Promise.all([db.from('cronograma_estado').select('payload,revision').eq('id',1).single(),db.from('cronograma_integrantes').select('*').order('orden'),db.from('cronograma_integrantes_eventos').select('*').order('id')]);if(r.error||a.error||e.error){say('Error de Supabase: '+(r.error||a.error||e.error).message,true);return;}record=r.data.payload;record.state.rules=record.state.rules||[];record.state.settledWeeks=record.state.settledWeeks||{};record.state.manual=record.state.manual||{};revision=r.data.revision;people=a.data;events=e.data;dirty=false;render();say('✓ Conectado con Supabase · revisión '+revision);}
+async function boot(preserveDraft=false){
+  if(!db){say('El módulo de edición no se cargó. Prueba nuevamente.',true);return;}
+  try{
+    const {data:{user},error}=await Promise.race([db.auth.getUser(),new Promise((_,reject)=>setTimeout(()=>reject(Error('Tiempo agotado al comprobar usuario')),7000))]);
+    if(error)throw error;sessionEmail=user?.email||'';role='';
+    if(user){const {data:permission,error:perr}=await db.from('cronograma_usuarios').select('rol').eq('usuario_id',user.id).maybeSingle();if(perr)throw perr;role=permission?.rol||'';}
+    if(!preserveDraft)await load();else render();
+  }catch(err){role='';say('No se pudo verificar la cuenta editora: '+err.message,true);}
+}
+async function connectRead(){if(dirty&&!confirm('Hay cambios sin grabar. ¿Descartarlos y actualizar?'))return;await load();}
+async function publicGET(table,qs=''){
+  const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),12000);
+  try{
+    const response=await fetch(SUPABASE_URL+'/rest/v1/'+table+'?'+qs,{headers:{apikey:KEY,Accept:'application/json'},signal:controller.signal,cache:'no-store'});
+    if(!response.ok){let txt=await response.text();throw Error(table+': HTTP '+response.status+' '+txt.slice(0,280));}
+    return await response.json();
+  }finally{clearTimeout(timer);}
+}
+async function load(){
+  say('Consultando el cronograma en Supabase...');
+  try{
+    const [state,members,history]=await Promise.all([
+      publicGET('cronograma_estado','select=payload,revision&id=eq.1'),
+      publicGET('cronograma_integrantes','select=*&order=orden.asc'),
+      publicGET('cronograma_integrantes_eventos','select=*&order=id.asc')
+    ]);
+    if(!state?.[0]?.payload)throw Error('La tabla del cronograma no devolvió datos.');
+    const next=state[0].payload;
+    next.state=next.state||{};next.state.rules=next.state.rules||[];
+    next.state.settledWeeks=next.state.settledWeeks||{};next.state.manual=next.state.manual||{};
+    record=next;revision=state[0].revision;people=members;events=history;dirty=false;
+    render();say('✓ Conectado con Supabase: '+members.length+' integrantes · '+next.state.rules.length+' reglas.');
+  }catch(err){render();say('⚠ Error de lectura: '+(err.name==='AbortError'?'La conexión agotó el tiempo de espera':err.message),true);console.error('Consulta pública Supabase:',err);}
+}
 async function authorize(){if(role!=='editor'){openAccess();say('Para grabar, inicia sesión con una cuenta editora.',true);return false;}const password=$('savePassword').value;if(!password){say('Escribe la clave en el campo superior para grabar.',true);$('savePassword').focus();return false;}const {error}=await db.auth.signInWithPassword({email:sessionEmail,password});$('savePassword').value='';if(error){say('Clave incorrecta o sesión no válida.',true);return false;}return true;}
 async function saveAll(verified=false){if(!record)return;if(!dirty){say('No existen modificaciones pendientes.');return;}if(role!=='editor'){openAccess();say('Para Grabar necesitas identificarte como editor.',true);return;}if(!verified&&!await authorize())return;const rev=revision;const {data,error}=await db.from('cronograma_estado').update({payload:record,revision:rev+1,actualizado_en:new Date().toISOString()}).eq('id',1).eq('revision',rev).select('revision');if(error||!data?.length){say('⚠ No se pudo grabar. '+(error?.message||'Otra persona cambió el cronograma; conserva tu pestaña y revisa los cambios.'),true);return;}revision=data[0].revision;dirty=false;render();say('✓ Grabado en Supabase · revisión '+revision);}
 async function refresh(){if(dirty&&!confirm('Hay modificaciones sin guardar. ¿Descartarlas?'))return;await boot();}
 function exportJSON(){if(!record){say('Conéctate para exportar los datos.',true);return;}const a=document.createElement('a'),u=URL.createObjectURL(new Blob([JSON.stringify({payload:record,revision,integrantes:people,eventos:events,exportado:new Date().toISOString()},null,2)],{type:'application/json'}));a.href=u;a.download='CronogramaPresencialidad_Respaldo.json';a.click();setTimeout(()=>URL.revokeObjectURL(u),500);}
-(async()=>{if(db)await connectRead();else{render();say('No se cargó Supabase. Revisa tu conexión a internet.',true);}})();
+render();connectRead();
 </script></body></html>
